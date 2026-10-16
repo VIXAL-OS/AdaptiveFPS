@@ -1,0 +1,6 @@
+## Interface: 30300
+## Title: Adaptive FPS
+## Notes: When the frame rate stays low, steps shadows and then distant detail down, and back up when it recovers. /afps
+## Version: 1.0
+## SavedVariables: ChromieAdaptiveFPSDB
+AdaptiveFPS.lua
