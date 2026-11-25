@@ -37,13 +37,24 @@ There are six steps below your normal settings, taken one at a time:
 - `/afps combat 5-60`: in combat, step down only below this.
 - `/afps scope busy` / `/afps scope all`: cities and instances only, or everywhere.
 - `/afps baseline`: save your current settings as the normal ones.
+- `/afps bench`, `/afps bench report`, `/afps bench stop`: measure what each shadow level costs where you stand (see below).
 - `/afps profile`, then `/afps report`: measure which addons use the most CPU over 30 seconds. Profiling needs a `/reload` to start and another to switch off.
+
+## Measuring what shadows cost
+`/afps bench` holds each shadow level your graphics setup supports for 20 seconds, from 0 up to the highest and back down again, and counts the frames. It takes about 5 minutes. Then it prints, for each level, the average frame rate and frame time, the slowest second, and how many milliseconds a frame it costs over level 0. Your normal shadows are put back at the end.
+
+- **Stay put, or keep walking the same loop, with WoW in front.** Standing still and moving can give different answers, so measure both. `/afps bench 20 walking` labels a run so you can tell them apart; the number is seconds a level (5 to 120).
+- **Going up and back cancels drift.** A crowd arriving halfway through lands on both passes of every level. Level 0 is measured first and last, and the report says how far apart those two were: smaller differences than that are noise.
+- **A frame cap hides the answer.** If a level ran steadily at your frame cap (`maxfps`, or 30 with WoW in the background), the report says so. Measure somewhere busier.
+- **It stops by itself** if combat starts, a loading screen or cinematic comes up, you leave the zone, open Video Options or use `/afps off`; your normal shadows come back and nothing is saved. A long hitch repeats that level's pass.
+- **Adaptive FPS is paused while it runs,** and waits 20 seconds afterwards before it adapts again.
+- **Results:** the last eight runs are kept in `ChromieAdaptiveFPSDB.bench`, and reach the disk on `/reload` or logout. `/afps bench report` prints the latest again.
 
 ## Install
 Copy the `AdaptiveFPS` folder into `Interface\AddOns`. Settings are saved in `ChromieAdaptiveFPSDB`. Settings kept by the copy that used to be embedded in Carbonite Runes are taken over on first login. If both copies are installed, only one runs.
 
 ## Tests
-`python tests/test_adaptive_fps.py` runs the addon under Lua 5.1 (`pip install lupa`) against a mocked client: 33 checks, covering the stepping and restoring, combat, the background frame cap, manual changes, Video Options, reload and crash recovery, rejected settings, and the CPU profiler.
+`python tests/test_adaptive_fps.py` runs the addon under Lua 5.1 (`pip install lupa`) against a mocked client: 41 checks, covering the stepping and restoring, combat, the background frame cap, manual changes, Video Options, reload and crash recovery, rejected settings, the CPU profiler, and the shadow bench.
 
 Written with AI coding assistants (Claude Code and Codex).
 

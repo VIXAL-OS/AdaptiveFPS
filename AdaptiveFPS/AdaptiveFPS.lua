@@ -1,6 +1,7 @@
 -- Adaptive FPS for Wrath 3.3.5a: when the frame rate stays below a target, step shadows and then distant detail down
 -- (view distance, ground clutter, environment detail), and step them back up when it recovers. Every change is
 -- reversible: your own settings are restored on /afps off, on logout and when Video Options opens.
+-- /afps bench measures what each shadow level costs where you stand, and puts your shadows back afterwards.
 -- No graphics restart, DLL calls, character-detail or combat-effect changes.
 -- The guard keeps a second copy (Carbonite Runes once embedded this) from starting a second controller.
 if not ChromieAdaptiveFPSLoaded then
@@ -32,6 +33,11 @@ local rejected, reason = {}, "starting"
 local capWindow, capSpread, recent, atCap = 5, .8, {}, false
 local profile, profileNeedsReload
 local profilingAtLoad = GetCVar("scriptProfile")=="1"
+-- /afps bench (further down) measures what each shadow level costs where you stand. While it runs it owns the shadow
+-- setting and the controller is paused. benchSettle: seconds before the first level; benchWarm: seconds thrown away
+-- after each change, while the client rebuilds its shadow maps; benchKeep: saved runs kept.
+local bench, stopBench
+local benchSettle, benchWarm, benchKeep = 5, 3, 8
 local function say(text)
     DEFAULT_CHAT_FRAME:AddMessage("|cff69adffAdaptive FPS:|r "..text)
 end
@@ -144,6 +150,7 @@ end
 -- normal CVars before editing, and refresh only the affected controls.
 local function optionsOpened()
     if not db then return end
+    if bench then stopBench("Video Options opened") end
     captureMissing(); syncManualChanges(GetTime()); restore()
     local controlled={farclip=true,groundEffectDist=true,environmentDetail=true,extShadowQuality=true}
     for _,control in pairs(VideoOptionsEffectsPanel and VideoOptionsEffectsPanel.controls or {}) do
@@ -230,6 +237,172 @@ local function profileTick(now)
         say("Run /reload to switch profiling off.")
     end
 end
+-- Shadow bench. GetFramerate() is smoothed, so this counts the frames themselves. Each level the graphics setup
+-- supports is held for the same time, up the levels and back down, so slow drift (a crowd arriving) lands on both
+-- sides of every level; the lowest level is therefore measured first and last, and the gap between those two passes
+-- says how much of any difference is noise.
+local function benchReport(run)
+    if not run then say("No bench saved yet. /afps bench measures the shadow levels where you stand."); return end
+    say(string.format("Shadow bench, %s%s, %d seconds a level, up and back%s:",tostring(run.zone or "unknown place"),
+        run.label and run.label~="" and " ("..run.label..")" or "",run.seconds,run.when and ", "..run.when or ""))
+    local base=run.levels[1]
+    local capped={}
+    for _,row in ipairs(run.levels) do
+        local text=string.format("level %d: %.1f FPS (%.1f ms), worst second %.1f",row.level,row.fps,row.ms,row.worst or row.fps)
+        if row.second then text=text..string.format("; the two passes %.1f and %.1f",row.first,row.second) end
+        if row~=base then text=text..string.format("; %+.1f ms against level %d",row.ms-base.ms,base.level) end
+        if row.level==run.normal then text=text.." (your normal)" end
+        if row.cap then capped[#capped+1]=row.level end
+        say(text)
+    end
+    if base and base.second then
+        say(string.format("Level %d was measured first and last: %.1f and %.1f FPS. Differences smaller than that gap are noise.",
+            base.level,base.first,base.second))
+    end
+    if #capped>0 then
+        say("Held at a frame cap, so possibly faster than shown: level "..table.concat(capped,", ")
+            ..". Try a busier place, and keep WoW in front.")
+    end
+    if run.refused and #run.refused>0 then
+        say("Not available with this graphics setup: level "..table.concat(run.refused,", ")..".")
+    end
+end
+-- The level is owned like any step's value (db.applied), so a crash or reload in the middle puts the normal one back.
+local function benchSet(value)
+    local actual=read("extShadowQuality")
+    if not equal(actual,value) then
+        local ok=pcall(SetCVar,"extShadowQuality",tostring(value))
+        actual=read("extShadowQuality")
+        if not ok or not equal(actual,value) then return false end
+    end
+    if equal(actual,db.baseline.extShadowQuality) then db.applied.extShadowQuality=nil
+    else db.applied.extShadowQuality=actual end
+    return true
+end
+local function benchBegin(now)
+    local b=bench
+    b.warmUntil=now+benchWarm
+    b.frames,b.time,b.secFrames,b.secTime,b.worst=0,0,0,0,nil
+end
+local function benchFinish(now)
+    local b=bench
+    bench=nil
+    restore()
+    clearSamples(); warmUntil=math.max(warmUntil,now+20); reason="settling after the shadow bench"
+    local run={when=type(date)=="function" and date("%Y-%m-%d %H:%M") or nil,zone=GetRealZoneText(),
+        subzone=type(GetSubZoneText)=="function" and GetSubZoneText() or nil,label=b.label,seconds=b.seconds,
+        normal=b.normal,farclip=read("farclip"),levels={},refused={}}
+    local caps={}
+    for _,key in ipairs({"maxfps","maxfpsbk"}) do
+        local cap=read(key)
+        if not cap and key=="maxfpsbk" then cap=30 end
+        if cap and cap>0 then caps[#caps+1]=cap end
+    end
+    for value=0,b.top do
+        local passes=b.passes[value]
+        if passes then
+            local frames,time,worst=0,0,nil
+            for _,pass in ipairs(passes) do
+                frames=frames+pass.frames; time=time+pass.time
+                if pass.worst and (not worst or pass.worst<worst) then worst=pass.worst end
+            end
+            local row={level=value,fps=frames/time,ms=1000*time/frames,worst=worst,
+                first=passes[1].frames/passes[1].time,second=passes[2] and passes[2].frames/passes[2].time}
+            -- At a cap the rate is also steady: a scene that merely averages 30 has seconds well below it.
+            for _,cap in ipairs(caps) do
+                if row.fps>=cap-1.5 and row.fps<=cap+1 and (worst or row.fps)>=cap-1.5 then row.cap=cap end
+            end
+            run.levels[#run.levels+1]=row
+        elseif b.refused[value] then run.refused[#run.refused+1]=value end
+    end
+    if #run.levels==0 then say("Bench: the client accepted none of the shadow levels; nothing was measured."); return end
+    db.bench=type(db.bench)=="table" and db.bench or {}
+    table.insert(db.bench,run)
+    while #db.bench>benchKeep do table.remove(db.bench,1) end
+    benchReport(run)
+    say("Saved; your normal shadows are back. /reload or logging out writes it to disk; /afps bench report shows it again.")
+end
+local function benchNext(now)
+    local b=bench
+    while true do
+        b.index=b.index+1
+        local value=b.order[b.index]
+        if not value then benchFinish(now); return end
+        if benchSet(value) then b.phase="level"; benchBegin(now); return end
+        b.refused[value]=true
+    end
+end
+local function benchFrame(elapsed,now)
+    local b=bench
+    if b.phase=="settle" then
+        if now>=b.settleUntil then benchNext(now) end
+        return
+    end
+    -- A long frame (a loading hitch, alt-tab) spoils the pass: take it again, and give up if it keeps happening.
+    if elapsed>.5 then
+        b.stalls=b.stalls+1
+        if b.stalls>3 then stopBench("too many long stalls; was WoW in front the whole time?") else benchBegin(now) end
+        return
+    end
+    if now<b.warmUntil then return end
+    b.frames=b.frames+1; b.time=b.time+elapsed
+    b.secFrames=b.secFrames+1; b.secTime=b.secTime+elapsed
+    if b.secTime>=1 then
+        local rate=b.secFrames/b.secTime
+        if not b.worst or rate<b.worst then b.worst=rate end
+        b.secFrames,b.secTime=0,0
+        if fighting or UnitAffectingCombat("player") then stopBench("combat started"); return end
+        if shown("CinematicFrame") or shown("MovieFrame") then stopBench("a cinematic started"); return end
+    end
+    if b.time>=b.seconds then
+        local value=b.order[b.index]
+        b.passes[value]=b.passes[value] or {}
+        table.insert(b.passes[value],{frames=b.frames,time=b.time,worst=b.worst})
+        benchNext(now)
+    end
+end
+stopBench=function(why)
+    if not bench then return end
+    bench=nil
+    local restored=restore()
+    clearSamples(); warmUntil=math.max(warmUntil,GetTime()+10); reason="settling after the shadow bench"
+    say("Bench stopped: "..why..(restored and "; your normal shadows are back." or "; the client rejected a restoration, /afps shows current values.")
+        .." Nothing was saved.")
+end
+local function startBench(arg,now)
+    if bench then
+        say(string.format("Bench is running: pass %d of %d. /afps bench stop cancels it.",math.max(bench.index,1),#bench.order))
+        return
+    end
+    if profile or profileNeedsReload then say("Finish the CPU capture first (/reload)."); return end
+    if not ready or not inWorld then return end
+    if fighting or UnitAffectingCombat("player") then say("Not in combat: the bench changes shadows every few seconds."); return end
+    if shown("VideoOptionsFrame") then say("Close Video Options first."); return end
+    local seconds,label=string.match(arg,"^(%d+)%s*(.-)$")
+    seconds=tonumber(seconds)
+    if not seconds then seconds,label=20,arg end
+    if seconds<5 or seconds>120 then say("Use /afps bench 5-120: seconds a level, 20 if left out. A word after it labels the run."); return end
+    local steppedDown=level>0
+    captureMissing(); syncManualChanges(now); restore()
+    local normal=read("extShadowQuality")
+    if not normal then say("This client has no extShadowQuality setting to measure."); return end
+    local top=5
+    if type(GetCVarMax)=="function" then
+        local ok,value=pcall(GetCVarMax,"extShadowQuality")
+        value=ok and tonumber(value)
+        if value and value>=0 and value<5 then top=math.floor(value) end
+    end
+    local order={}
+    for value=0,top do order[#order+1]=value end
+    for value=top,0,-1 do order[#order+1]=value end
+    -- Restoring a stepped-down view distance can bring a short loading screen: wait longer before the first level.
+    local settle=steppedDown and 15 or benchSettle
+    bench={seconds=seconds,label=label or "",order=order,index=0,top=top,normal=normal,passes={},refused={},stalls=0,
+        phase="settle",settleUntil=now+settle}
+    reason="paused for the shadow bench"
+    say(string.format("Bench: shadow levels 0-%d, %d seconds each, up and back: about %.0f minutes. Stand still, or keep walking"
+        .." the same loop, with WoW in front. /afps bench stop cancels it.",top,seconds,(#order*(seconds+benchWarm)+settle)/60))
+end
 local function tick(now)
     if not db or not ready or not inWorld then return end
     if profile or profileNeedsReload then reason="paused for CPU measurement; /reload when finished"; return end
@@ -275,6 +448,7 @@ end
 local function status()
     say(string.format("%s; target %d FPS (%d in combat); detail step %d/%d; FPS %s; %s.",
         db.enabled and "On" or "Off",db.target,db.combatTarget,level,#profiles-1,tostring(db.lastFPS or "pending"),reason))
+    if bench then say(string.format("Shadow bench running: pass %d of %d.",math.max(bench.index,1),#bench.order)) end
     for _,key in ipairs(keys) do
         say(string.format("%s: %s (normal %s)",key,tostring(read(key)),tostring(db.baseline[key] or "pending")))
     end
@@ -282,6 +456,8 @@ end
 local function command(input)
     if not db then return end
     local cmd,arg=string.match(string.lower(input or ""),"^%s*(%S*)%s*(.-)%s*$")
+    -- These put the normal settings back or redefine them, which a running bench cannot survive.
+    if bench and (cmd=="off" or cmd=="restore" or cmd=="baseline") then stopBench("/afps "..cmd) end
     if cmd=="off" or cmd=="restore" then
         syncManualChanges(GetTime()); local restored=restore(); db.enabled=false; reason="off"
         say(restored and "Off; normal settings restored." or "Off; the client rejected a restoration. /afps shows current values.")
@@ -302,14 +478,20 @@ local function command(input)
         -- Explicitly accept the current live profile; never do this on reload.
         db.baseline={}; db.applied={}; level=0; db.level=0; captureMissing(); clearSamples()
         warmUntil=GetTime()+15; say("Current visuals saved as the normal profile.")
+    elseif cmd=="bench" then
+        if arg=="stop" then
+            if bench then stopBench("stopped by you") else say("No bench is running.") end
+        elseif arg=="report" then benchReport(type(db.bench)=="table" and db.bench[#db.bench] or nil)
+        else startBench(arg,GetTime()) end
     elseif cmd=="profile" then
+        if bench then say("Stop the bench first: /afps bench stop."); return end
         if profile then say("CPU capture is already running."); return end
         if profileNeedsReload then say("Run /reload to finish the previous profiling session first."); return end
         db.profileRequested=true;SetCVar("scriptProfile","1")
         say("Profiling prepared. Run /reload, wait 40 seconds here, then /reload again. /afps report retains the result.")
     elseif cmd=="report" then profileReport()
     elseif cmd=="" or cmd=="status" then status()
-    else say("/afps status | on | off | target 45 | combat 15 | scope busy/all | baseline | profile | report") end
+    else say("/afps status | on | off | target 45 | combat 15 | scope busy/all | baseline | bench | bench report | profile | report") end
 end
 SLASH_CHROMIEADAPTIVEFPS1="/afps"
 SlashCmdList.CHROMIEADAPTIVEFPS=command
@@ -339,15 +521,19 @@ frame:SetScript("OnEvent",function(self,event)
     elseif event=="PLAYER_ENTERING_WORLD" then
         inWorld=true; warmUntil=GetTime()+20; clearSamples()
     elseif event=="PLAYER_LEAVING_WORLD" then
+        if bench then stopBench("a loading screen") end
         inWorld=false; restore()
         if profile then db.cpuReport={error="world/loading transition interrupted capture"};profileCleanup() end
     elseif event=="ZONE_CHANGED_NEW_AREA" then
+        if bench then stopBench("you left the zone") end
         warmUntil=math.max(warmUntil,GetTime()+8); clearSamples()
     elseif event=="PLAYER_REGEN_DISABLED" then
         fighting=true; clearSamples()
+        if bench then stopBench("combat started") end
     elseif event=="PLAYER_REGEN_ENABLED" then
         fighting=false; clearSamples()
     elseif event=="PLAYER_LOGOUT" then
+        bench=nil
         restore()
         if profile then db.cpuReport={error="reload/logout interrupted capture"};profileCleanup() end
     end
@@ -355,6 +541,7 @@ end)
 frame:SetScript("OnUpdate",function(self,elapsed)
     if not ready or not inWorld then return end
     if profile then profileTick(GetTime()); return end
+    if bench then benchFrame(elapsed,GetTime()); return end
     -- A long frame or alt-tab stall is not evidence of sustained scene load.
     if elapsed>.5 then clearSamples(); elapsedTotal=0; warmUntil=math.max(warmUntil,GetTime()+5); return end
     elapsedTotal=elapsedTotal+elapsed

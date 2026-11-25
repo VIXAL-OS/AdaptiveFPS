@@ -22,8 +22,12 @@ function GetTime() return now end
 function GetCVar(k) return cvars[k] and tostring(cvars[k]) end
 function SetCVar(k,v)
  if reject==k then error('mock rejected CVar') end
+ if rejectLevel and k=='extShadowQuality' and tonumber(v)==rejectLevel then error('mock rejected shadow level') end
  cvars[k]=tonumber(v); writes[#writes+1]={key=k,value=tonumber(v),time=now}
 end
+function GetCVarMax(k) return cvarMax and cvarMax[k] end
+function GetSubZoneText() return 'Krasus Landing' end
+date=os.date
 function GetFramerate() return fps end
 function GetRealZoneText() return zone end
 function GetZonePVPInfo() return pvp end
@@ -75,6 +79,25 @@ function step(seconds,newFPS)
  for i=1,math.floor(seconds*10) do now=now+.1;controller.scripts.OnUpdate(controller,.1) end
 end
 function cmd(s) SlashCmdList.CHROMIEADAPTIVEFPS(s) end
+-- Real frames, as the bench counts them: each lasts 1/rate seconds, and the rate follows the shadow level the way a
+-- scene's would. step() above only feeds ten updates a second whatever the frame rate is said to be.
+sceneRate=function(shadows) return 60-5*shadows end
+function play(seconds)
+ local left=seconds
+ while left>0 do
+  local dt=1/sceneRate(cvars.extShadowQuality)
+  now=now+dt;left=left-dt;controller.scripts.OnUpdate(controller,dt)
+ end
+end
+function shadowWrites()
+ local list={}
+ for _,w in ipairs(writes) do if w.key=='extShadowQuality' then list[#list+1]=w.value end end
+ return table.concat(list,',')
+end
+function said(text)
+ for _,m in ipairs(messages) do if string.find(m,text,1,true) then return true end end
+ return false
+end
 """)
     lua.execute(prelude)
     lua.execute(source)
@@ -255,6 +278,91 @@ cmd('off');assert(cvars.extShadowQuality==5 and cvars.farclip==2000)
 case('Reload recovery restores a shadow value applied before a crash',"""
 assert(cvars.extShadowQuality==5 and ChromieAdaptiveFPSDB.baseline.extShadowQuality==5)
 ""","cvars.extShadowQuality=2;CarboniteRunesDB={adaptiveFPS={baseline={extShadowQuality=5},applied={extShadowQuality=2}}}")
+case('Bench holds each shadow level up and back, counts real frames, saves the run and restores normal shadows',"""
+cmd('bench 10 Standing');assert(said('about 3 minutes'))
+play(5+12*13+1)
+local runs=ChromieAdaptiveFPSDB.bench;assert(runs and #runs==1)
+local r=runs[1]
+assert(r.zone=='Dalaran' and r.subzone=='Krasus Landing' and r.label=='standing' and r.seconds==10 and r.normal==5)
+assert(r.when and #r.levels==6 and #r.refused==0)
+for i,row in ipairs(r.levels) do
+ local rate=60-5*row.level
+ assert(row.level==i-1 and math.abs(row.fps-rate)<.01 and math.abs(row.ms-1000/rate)<.01)
+ assert(math.abs(row.first-rate)<.01 and math.abs(row.second-rate)<.01 and math.abs(row.worst-rate)<.01)
+ assert(not row.cap)
+end
+assert(shadowWrites()=='0,1,2,3,4,5,4,3,2,1,0,5')
+assert(cvars.extShadowQuality==5 and next(ChromieAdaptiveFPSDB.applied)==nil and ChromieAdaptiveFPSDB.level==0)
+assert(said('level 4: 40.0 FPS (25.0 ms), worst second 40.0; the two passes 40.0 and 40.0; +8.3 ms against level 0'))
+assert(said('level 5: 35.0 FPS') and said('(your normal)') and said('measured first and last: 60.0 and 60.0 FPS'))
+messages={};cmd('bench report');assert(said('Shadow bench, Dalaran (standing), 10 seconds a level'))
+""")
+case('The controller stays paused during a bench and settles before it adapts again',"""
+sceneRate=function() return 30 end
+step(25,30);cmd('bench 5');play(5+12*8+1)
+assert(#ChromieAdaptiveFPSDB.bench==1 and ChromieAdaptiveFPSDB.level==0)
+for _,w in ipairs(writes) do assert(w.key=='extShadowQuality') end
+local count=#writes;step(15,20);assert(#writes==count)
+step(30,20);assert(ChromieAdaptiveFPSDB.level>=1)
+""")
+case('Bench only tries the levels the graphics setup offers, and names one the client refuses',"""
+cmd('bench 5');play(5+8*8+1)
+local r=ChromieAdaptiveFPSDB.bench[1]
+assert(#r.levels==3 and r.levels[1].level==0 and r.levels[2].level==1 and r.levels[3].level==3)
+assert(#r.refused==1 and r.refused[1]==2 and said('Not available with this graphics setup: level 2'))
+assert(shadowWrites()=='0,1,3,1,0,3' and cvars.extShadowQuality==3)
+""","cvars.extShadowQuality=3;cvarMax={extShadowQuality=3};rejectLevel=2")
+case('Mid-bench the level is owned like any step, so a logout or crash recovery puts the normal one back',"""
+cmd('bench 10');play(5+13+13+5)
+assert(cvars.extShadowQuality==2 and ChromieAdaptiveFPSDB.applied.extShadowQuality==2)
+assert(ChromieAdaptiveFPSDB.baseline.extShadowQuality==5)
+event('PLAYER_LOGOUT');assert(cvars.extShadowQuality==5 and not ChromieAdaptiveFPSDB.bench)
+""")
+case('Combat, a loading screen, Video Options, leaving the zone, /afps off and /afps bench stop cancel a bench',"""
+local function running()
+ cmd('bench 10');play(5+13+5);assert(cvars.extShadowQuality==1)
+end
+local function cancelled(why)
+ assert(cvars.extShadowQuality==5 and not ChromieAdaptiveFPSDB.bench and next(ChromieAdaptiveFPSDB.applied)==nil)
+ assert(said('Bench stopped: '..why));messages={}
+ local count=#writes;play(40);assert(#writes==count)
+end
+running();event('PLAYER_REGEN_DISABLED');cancelled('combat started')
+cmd('bench 10');assert(said('Not in combat'));event('PLAYER_REGEN_ENABLED')
+running();openVideo();cancelled('Video Options opened');closeVideo()
+running();cmd('bench stop');cancelled('stopped by you')
+running();event('ZONE_CHANGED_NEW_AREA');cancelled('you left the zone')
+running();cmd('off');cancelled('/afps off');cmd('on')
+running();incombat=true;play(2);cancelled('combat started');incombat=false
+running();event('PLAYER_LEAVING_WORLD');cancelled('a loading screen')
+""")
+case('A long stall retakes the pass; stalls that keep coming stop the bench',"""
+cmd('bench 10');play(5+3+6)
+now=now+2;controller.scripts.OnUpdate(controller,2)
+play(13+11*13+1)
+local r=ChromieAdaptiveFPSDB.bench[1]
+assert(#r.levels==6 and math.abs(r.levels[1].fps-60)<.01 and math.abs(r.levels[1].first-60)<.01)
+cmd('bench 10');play(5+3+2)
+for i=1,4 do now=now+2;controller.scripts.OnUpdate(controller,2);play(1) end
+assert(said('too many long stalls') and #ChromieAdaptiveFPSDB.bench==1 and cvars.extShadowQuality==5)
+""")
+case('Bench marks levels that sat at a frame cap, and keeps only the last eight runs',"""
+cvars.maxfps=60;sceneRate=function(shadows) return shadows<=1 and 60 or 60-5*shadows end
+for i=1,9 do cmd('bench 5 run'..i);play(5+12*8+1) end
+local runs=ChromieAdaptiveFPSDB.bench
+assert(#runs==8 and runs[1].label=='run2' and runs[8].label=='run9')
+local r=runs[8]
+assert(r.levels[1].cap==60 and r.levels[2].cap==60 and not r.levels[3].cap and not r.levels[6].cap)
+assert(said('Held at a frame cap, so possibly faster than shown: level 0, 1'))
+""")
+case('Bench and the CPU capture do not overlap; bad arguments are refused',"""
+cmd('bench 3');assert(said('Use /afps bench 5-120') and #writes==0)
+cmd('bench stop');assert(said('No bench is running'))
+cmd('bench report');assert(said('No bench saved yet'))
+cmd('bench 10');cmd('profile');assert(said('Stop the bench first') and cvars.scriptProfile==nil)
+cmd('bench');assert(said('Bench is running: pass 1 of 12'))
+cmd('status');assert(said('Shadow bench running: pass 1 of 12'))
+""")
 for name in checks:
     print('ok   ', name)
 print('PASSED (%d checks)' % len(checks))
